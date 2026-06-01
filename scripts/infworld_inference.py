@@ -12,6 +12,7 @@ import torch
 import random
 import json
 import datetime
+import argparse
 import importlib
 import numpy as np
 from PIL import Image
@@ -27,6 +28,8 @@ sys.path.insert(0, PROJECT_ROOT)
 from infworld.utils.prepare_dataloader import get_obj_from_str
 from infworld.utils.data_utils import get_first_clip_from_video, save_silent_video
 from infworld.utils.dataset_utils import is_vid, is_img
+from infworld.models.checkpoint import set_grad_checkpoint
+from infworld.models.scheduler import timestep_transform
 
 # ============================================================================
 # Action Mapping Dictionaries
@@ -75,6 +78,7 @@ def resize_and_center_crop(image, target_size):
     final_w = math.ceil(scale * orig_w)
     
     resized = cv2.resize(image, (final_w, final_h), interpolation=cv2.INTER_AREA)
+    resized = np.ascontiguousarray(resized)
     tensor = torch.from_numpy(resized)[None, ...].permute(0, 3, 1, 2).contiguous()
     cropped = transforms.functional.center_crop(tensor, target_size)
     return cropped[:, :, None, :, :]  # [1, C, 1, H, W]
@@ -178,8 +182,25 @@ setup_seed(GLOBAL_SEED + global_rank)
 TEXT_CFG_SCALE = 5.0
 NUM_SAMPLING_STEPS = 30
 SHIFT = 7  # PX256: 3, PX627: 7, PX960: 11
-NUM_CHUNKS = 13  # Number of video chunks to generate
+NUM_CHUNKS = 3  # Number of video chunks to generate
 HIGH_QUALITY_SAVE = True
+
+# Online (test-time) training between chunks (overridable via --online-training/--no-online-training)
+_cli_parser = argparse.ArgumentParser(add_help=False)
+_cli_parser.add_argument(
+    "--online-training",
+    type=lambda s: s.strip().lower() in ("on", "true", "1", "yes"),
+    default=False,
+    help="Enable online (test-time) training between chunks: on/off",
+)
+_cli_args, _ = _cli_parser.parse_known_args()
+ENABLE_ONLINE_TRAINING = _cli_args.online_training
+
+N_TRAIN_STEPS = 5
+TRAIN_LR = 1e-5
+RESET_BETWEEN_VIDEOS = True   # dynamic switch: restore pretrained weights between prompts
+USE_GRAD_CHECKPOINT = True    # use_reentrant=False set in infworld/models/checkpoint.py
+GRAD_CLIP_NORM = 1.0
 
 # Paths - checkpoint_path is read from config (configs/infworld_config.yaml)
 # Model config - use standalone config
@@ -219,6 +240,43 @@ def load_dit_state_dict(checkpoint_path):
         state_dict = state_dict["state_dict"]
     return state_dict
 
+
+def online_train_step(dit, scheduler, x_start, model_kwargs, optimizer):
+    """One rectified-flow training step on a single (x_start, model_kwargs) pair.
+
+    Mirrors RFlowScheduler.training_losses but calls the DiT with x_ignore_mask=None
+    so we avoid the post-temporal-compression mask shape requirement.
+    
+    x_start是刚刚由 scheduler.sample(...) 采样出来、还没解码回像素的那段视频潜变量 (latent),是视频样本不是采样的噪声
+    """
+    optimizer.zero_grad(set_to_none=True)
+    device = x_start.device
+    B = x_start.shape[0]
+
+    if scheduler.use_discrete_timesteps:
+        t = torch.randint(0, scheduler.num_timesteps, (B,), device=device)
+    elif scheduler.sample_method == "uniform":
+        t = torch.rand((B,), device=device) * scheduler.num_timesteps
+    else:  # logit-normal
+        t = scheduler.sample_t(x_start) * scheduler.num_timesteps
+    if scheduler.use_timestep_transform:
+        t = timestep_transform(t, shift=scheduler.shift, num_timesteps=scheduler.num_timesteps)
+
+    noise = torch.randn_like(x_start)
+    x_t = scheduler.add_noise(x_start, noise, t)
+    target = x_start - noise
+    if scheduler.use_reversed_velocity:
+        target = -target
+
+    pred = dit(x_t, t, x_ignore_mask=None, **model_kwargs) # x_ignore_mask它是一个布尔/0-1 掩码，形状 [B, T, H, W]，标记潜变量里哪些时空位置应该被忽略——既不参与 loss 计算，也不让对应的 token 影响注意力/输出,主要用于batch 内长度/分辨率对齐的 padding：当不同样本的视频长度或时空形状不一致、需要 pad 到统一形状时，用 x_ignore_mask=1 标出 pad 区域，让模型和 loss 都跳过它们
+    pred = pred[:, :, -x_start.shape[2]:] # DiT 的输入在时间维上是 [image_cond | x_t] 拼接的，所以输出 pred 时间长度 = T_cond + T_x，这里取后面T_x帧对应的输出作为 loss 计算对象
+
+    loss = ((pred.float() - target.float()) ** 2).mean()
+    loss.backward()
+    if GRAD_CLIP_NORM is not None:
+        torch.nn.utils.clip_grad_norm_(dit.parameters(), max_norm=GRAD_CLIP_NORM)
+    optimizer.step()
+    return loss.detach() # 返回一个和 loss 数值相同、但脱离计算图的新张量，没有反向传播的梯度，（requires_grad=False，没有 grad_fn）。
 
 def main():
     torch_gc()
@@ -281,7 +339,14 @@ def main():
     print(f"[InfWorld] Model loaded! Missing: {len(missing)}, Unexpected: {len(unexpected)}")
     
     dit.to(local_rank)
-    
+
+    if ENABLE_ONLINE_TRAINING and USE_GRAD_CHECKPOINT:
+        set_grad_checkpoint(dit)
+
+    init_params = None
+    if ENABLE_ONLINE_TRAINING and RESET_BETWEEN_VIDEOS:
+        init_params = {n: p.detach().clone() for n, p in dit.named_parameters()}
+
     # Load bucket config
     from infworld.configs import bucket_config as bucket_config_module
     bucket_config = getattr(bucket_config_module, BUCKET_CONFIG_NAME)
@@ -322,7 +387,21 @@ def main():
         latent_size = list(cond_latent.shape)
         latent_size[2] = 21  # Output frames per chunk
         latent_size = torch.Size(latent_size)
-        
+
+        # Online training setup for this video
+        optimizer = None
+        cached_y = cached_y_mask = None
+        if ENABLE_ONLINE_TRAINING:
+            if RESET_BETWEEN_VIDEOS and task_idx > 0 and init_params is not None:
+                with torch.no_grad():
+                    for n, p in dit.named_parameters():
+                        p.data.copy_(init_params[n])
+                print(f"[OnlineTrain] task {task_idx}: restored init params")
+            with torch.no_grad():
+                text_kwargs = text_encoder.encode([prompt])
+            cached_y, cached_y_mask = text_kwargs["y"], text_kwargs["y_mask"]
+            optimizer = torch.optim.AdamW(dit.parameters(), lr=TRAIN_LR)
+
         # Generate video chunks
         for chunk_idx in range(NUM_CHUNKS):
             print(f"[InfWorld] Generating chunk {chunk_idx + 1}/{NUM_CHUNKS}")
@@ -368,12 +447,30 @@ def main():
                 
                 decoded_chunk = vae.decode(samples).cpu()
                 video_buffer = torch.cat([video_buffer, decoded_chunk[:, :, 1:]], dim=2)
-                
+
                 print(f"[InfWorld] Chunk {chunk_idx + 1} done. Total frames: {video_buffer.shape[2]}")
                 torch_gc()
-        
-        # Save final video
-        video_name = f"{task_idx:04d}_{prompt[:30].replace(' ', '_')}"
+
+            # Online training: fine-tune on the chunk we just generated before producing the next one
+            if ENABLE_ONLINE_TRAINING and chunk_idx < NUM_CHUNKS - 1:
+                x_start = samples.detach()
+                train_kwargs = {
+                    "y": cached_y,
+                    "y_mask": cached_y_mask,
+                    "image_cond": current_latent.detach(),
+                    "move": move.unsqueeze(0).detach(),
+                    "view": view.unsqueeze(0).detach(),
+                }
+                for step in range(N_TRAIN_STEPS):
+                    loss_val = online_train_step(dit, scheduler, x_start, train_kwargs, optimizer)
+                    print(f"[OnlineTrain] task {task_idx} chunk {chunk_idx} step {step+1}/{N_TRAIN_STEPS} "
+                          f"loss={loss_val.item():.5f}")
+                del x_start, train_kwargs
+                torch_gc()
+
+        # Save final video (append current timestamp mm_dd_HH:MM:SS)
+        timestamp = datetime.datetime.now().strftime("%m_%d_%H:%M:%S")
+        video_name = f"{task_idx:04d}_{prompt[:30].replace(' ', '_')}_{timestamp}"
         save_path = os.path.join(output_dir, video_name)
         
         quality = 10 if HIGH_QUALITY_SAVE else 5
