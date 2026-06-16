@@ -195,6 +195,9 @@ class RFlowScheduler:
         additional_args=None,
         progress=True,
     ):
+        """
+        null_embedder: 用于CFG中的uncond embedding
+        """
         # if no specific guidance scale is provided, use the default scale when initializing the scheduler
         if guidance_scale is None:
             guidance_scale = self.cfg_scale
@@ -203,7 +206,7 @@ class RFlowScheduler:
         z = torch.randn(*z_size, device=device)
 
         if context_parallel_util.get_cp_size() > 1:
-            context_parallel_util.cp_broadcast(z)
+            context_parallel_util.cp_broadcast(z) # 多卡时把同一份噪声广播到组内所有 rank
         
         # For performance alignment
         # from source.opensora.utils.inference_utils import apply_mask_strategy
@@ -260,6 +263,7 @@ class RFlowScheduler:
 
         model_args["image_cond"] = model_args["image_cond"].repeat(2, 1, 1, 1, 1)
         progress_wrap = partial(tqdm, total=len(timesteps)) if progress else (lambda x: x)
+        # 不同timestep去噪过程
         for i, t in progress_wrap(enumerate(timesteps)):
             # mask for adding noise
             if mask is not None:

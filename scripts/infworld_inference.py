@@ -343,9 +343,35 @@ def main():
     if ENABLE_ONLINE_TRAINING and USE_GRAD_CHECKPOINT:
         set_grad_checkpoint(dit)
 
+    # A: freeze condition-input layers so online training cannot drift the model's
+    # interface to history (image_cond), actions, text, or timestep — these are what
+    # carry chunk-to-chunk continuity.
+    FREEZE_PREFIXES = (
+        "patch_embedding",   # raw latent -> token conv
+        "latent_encoder",    # image_cond (history) temporal encoder
+        "action_encoder",    # move / view embeddings
+        "text_embedding",    # T5 -> token projection
+        "time_embedding",    # timestep MLP
+        "time_projection",   # timestep -> per-block modulation
+        "y_embedder",        # null caption embedding
+    )
+    trainable_params = []
+    frozen_n = 0
+    for n, p in dit.named_parameters():
+        if n.startswith(FREEZE_PREFIXES):
+            p.requires_grad_(False)
+            frozen_n += p.numel()
+        else:
+            p.requires_grad_(True)
+            trainable_params.append(p)
+    print(f"[OnlineTrain] frozen params (cond entry layers): {frozen_n:,}; "
+          f"trainable: {sum(p.numel() for p in trainable_params):,}")
+
     init_params = None
     if ENABLE_ONLINE_TRAINING and RESET_BETWEEN_VIDEOS:
-        init_params = {n: p.detach().clone() for n, p in dit.named_parameters()}
+        # Only snapshot trainable params — frozen ones can never drift.
+        init_params = {n: p.detach().clone()
+                       for n, p in dit.named_parameters() if p.requires_grad}
 
     # Load bucket config
     from infworld.configs import bucket_config as bucket_config_module
@@ -383,40 +409,38 @@ def main():
         # Initialize video buffer
         video_buffer = cond_video.clone().cpu()
         
-        # Latent size for generation
+        # 定义Latent size，size是 [B, C, T, H, W]，其中T是时间维度长度，改为21（1帧条件 + 20帧生成）以适配 DiT 的输出要求
         latent_size = list(cond_latent.shape)
         latent_size[2] = 21  # Output frames per chunk
         latent_size = torch.Size(latent_size)
 
-        # Online training setup for this video
-        optimizer = None
+        # Online training setup for this video (optimizer is created per-chunk; see C below)
         cached_y = cached_y_mask = None
         if ENABLE_ONLINE_TRAINING:
             if RESET_BETWEEN_VIDEOS and task_idx > 0 and init_params is not None:
                 with torch.no_grad():
                     for n, p in dit.named_parameters():
-                        p.data.copy_(init_params[n])
+                        if n in init_params:
+                            p.data.copy_(init_params[n])
                 print(f"[OnlineTrain] task {task_idx}: restored init params")
             with torch.no_grad():
                 text_kwargs = text_encoder.encode([prompt])
             cached_y, cached_y_mask = text_kwargs["y"], text_kwargs["y_mask"]
-            optimizer = torch.optim.AdamW(dit.parameters(), lr=TRAIN_LR)
 
         # Generate video chunks
         for chunk_idx in range(NUM_CHUNKS):
             print(f"[InfWorld] Generating chunk {chunk_idx + 1}/{NUM_CHUNKS}")
             
             with torch.no_grad():
-                current_cond = video_buffer.to(local_rank)
+                current_cond = video_buffer.to(local_rank) # 不是in-place操作，video_buffer 仍然在 CPU 上，current_cond 是它在 GPU 上的一个副本
                 current_latent = vae.encode(current_cond)
             
-            # Get action slice for current chunk
-            curr_start = video_buffer.shape[2] - 1
+            # 取出move和view序列，如果不够长就pad
+            curr_start = video_buffer.shape[2] - 1  #从curr_start[int]帧开始，到curr_end这一帧结束
             curr_end = curr_start + args.validation_data.num_frames
             
             move = torch.tensor(move_indices[curr_start:curr_end], dtype=torch.long, device=local_rank)
             view = torch.tensor(view_indices[curr_start:curr_end], dtype=torch.long, device=local_rank)
-            
             # Pad if needed
             num_frames = args.validation_data.num_frames
             if move.shape[0] < num_frames:
@@ -424,14 +448,13 @@ def main():
                 move = torch.cat([move, torch.zeros(pad_len, dtype=torch.long, device=local_rank)])
                 view = torch.cat([view, torch.zeros(pad_len, dtype=torch.long, device=local_rank)])
             
+            # 进行sample，生成此chunk视频
             additional_args = {
                 "image_cond": current_latent,
                 "move": move.unsqueeze(0),
                 "view": view.unsqueeze(0),
             }
-            
-            torch_gc()
-            
+            torch_gc() # 自定义的，torch.cuda.empty_cache() 和 torch.cuda.ipc_collect()，用来回收被删除的张量的 CUDA 缓存和跨进程通信的缓存
             with torch.no_grad():
                 samples = scheduler.sample(
                     model=dit,
@@ -444,15 +467,17 @@ def main():
                     device=torch.device(local_rank),
                     additional_args=additional_args,
                 )
-                
+                    
                 decoded_chunk = vae.decode(samples).cpu()
                 video_buffer = torch.cat([video_buffer, decoded_chunk[:, :, 1:]], dim=2)
 
                 print(f"[InfWorld] Chunk {chunk_idx + 1} done. Total frames: {video_buffer.shape[2]}")
                 torch_gc()
 
-            # Online training: fine-tune on the chunk we just generated before producing the next one
+            # Online training: fine-tune on the chunk we just generated before producing the next one.
+            # C: optimizer is rebuilt per-chunk so Adam moments do NOT accumulate across chunks.
             if ENABLE_ONLINE_TRAINING and chunk_idx < NUM_CHUNKS - 1:
+                optimizer = torch.optim.AdamW(trainable_params, lr=TRAIN_LR)
                 x_start = samples.detach()
                 train_kwargs = {
                     "y": cached_y,
