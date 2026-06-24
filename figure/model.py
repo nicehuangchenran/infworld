@@ -2,6 +2,8 @@ from infworld.models.dit_model import WanModel
 from torchinfo import summary
 import torch
 
+
+
 def make_input():
     device = "cuda"
     dtype = torch.bfloat16
@@ -37,7 +39,26 @@ def make_input():
     kw = dict(y_mask=y_mask, image_cond=image_cond, move=move, view=view)
     return pos, kw
 
+def make_input2():
+    pos, kw = make_input()
+    x, t, y = pos
+
+    inputs = {
+        "x": x,
+        "t": t,
+        "y": y,
+        "y_mask": kw["y_mask"],
+        "image_cond": kw["image_cond"],
+        "move": kw["move"],
+        "view": kw["view"],
+    }
+
+    return inputs
+
+
 if __name__=="__main__":
+    METHOD="draw_graph"
+
     # 与 configs/infworld_config.yaml 的 model_cfg 保持一致（1.3B 配置），
     # 否则结构 / 通道数与 checkpoint 不符
     model=WanModel(
@@ -50,27 +71,38 @@ if __name__=="__main__":
         num_layers=30,
     ).cuda().to(torch.bfloat16)
 
-    pos, kw = make_input()
+    if METHOD=="summary":
+        # summary() 返回 ModelStatistics，str() 就是终端里那张表；
+        # 跑一次，复用结果写文件，避免重复 forward
+        pos, kw = make_input()
+        stats = summary(
+            model,
+            input_data=pos,
+            **kw,
+            depth=4,
+            col_names=["input_size", "output_size", "num_params", "trainable"],
+            # row_settings 让每层显示完整层级路径，便于定位
+            row_settings=["var_names", "depth"],
+            verbose=1,  # 1=打印到终端；写文件用下面的 str(stats)
+        )
 
-    # summary() 返回 ModelStatistics，str() 就是终端里那张表；
-    # 跑一次，复用结果写文件，避免重复 forward
-    stats = summary(
-        model,
-        input_data=pos,
-        **kw,
-        depth=4,
-        col_names=["input_size", "output_size", "num_params", "trainable"],
-        # row_settings 让每层显示完整层级路径，便于定位
-        row_settings=["var_names", "depth"],
-        verbose=1,  # 1=打印到终端；写文件用下面的 str(stats)
-    )
+        # 1) torchinfo 宽表（参数量 / 输入输出形状）
+        with open("figure/model_summary.txt", "w") as f:
+            f.write(str(stats))
 
-    # 1) torchinfo 宽表（参数量 / 输入输出形状）
-    with open("figure/model_summary.txt", "w") as f:
-        f.write(str(stats))
+        print("\nsaved -> figure/model_summary.txt")
+    elif METHOD=="draw_graph":
+        from torchview import draw_graph
+        inputs=make_input2()
+        graph = draw_graph(
+            model,
+            input_data=inputs,  # 按你的输入改
+            expand_nested=True,             # 展开子模块
+            graph_name="WanModel"
+        )
 
-    # 2) 纯模块树（结构层级，无形状/参数量，最简洁）
-    with open("figure/model_structure.txt", "w") as f:
-        print(model, file=f)
-
-    print("\nsaved -> figure/model_summary.txt, figure/model_structure.txt")
+        graph.visual_graph.render(filename="figure/wan_model_graph2", format="svg")
+        print("完成")
+    else:
+        print("检查 METHOD 变量")
+            
