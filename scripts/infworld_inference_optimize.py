@@ -161,7 +161,7 @@ setup_seed(GLOBAL_SEED + global_rank)
 TEXT_CFG_SCALE = 5.0
 NUM_SAMPLING_STEPS = 30
 SHIFT = 7
-NUM_CHUNKS = 3
+NUM_CHUNKS = 10
 HIGH_QUALITY_SAVE = True
 
 _cli_parser = argparse.ArgumentParser(add_help=False)

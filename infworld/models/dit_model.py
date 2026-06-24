@@ -29,6 +29,11 @@ except ModuleNotFoundError:
     FLASH_ATTN_2_AVAILABLE = False
 
 import warnings
+warnings.filterwarnings(
+    "ignore",
+    message=".*torch.cuda.amp.autocast.*is deprecated.*",
+    category=FutureWarning,
+) # 自己添加
 
 __all__ = ['WanModel']
 
