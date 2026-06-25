@@ -231,7 +231,7 @@ _cli_parser = argparse.ArgumentParser(add_help=False)
 _cli_parser.add_argument(
     "--online-training",
     type=lambda s: s.strip().lower() in ("on", "true", "1", "yes"),
-    default=False,
+    default=True,
     help="Enable online (test-time) training between chunks: on/off",
 )
 _cli_args, _ = _cli_parser.parse_known_args()
@@ -338,10 +338,7 @@ def mem_record(tag="", optimizer=None, model=None, reset_peak=False):
     reserved = torch.cuda.memory_reserved()
     max_allocated = torch.cuda.max_memory_allocated()
 
-    print(f"\n[Mem][{tag}]")
-    print(f"  allocated : {allocated/1024**2:.2f} MB")
-    print(f"  reserved  : {reserved/1024**2:.2f} MB")
-    print(f"  peak      : {max_allocated/1024**2:.2f} MB")
+    print(f"[Mem][{tag}]  allocated: {allocated/1024**3:.2f} GB  reserved: {reserved/1024**3:.2f} GB  peak: {max_allocated/1024**3:.2f} GB")
 
     param_mem = 0
     grad_mem = 0
@@ -353,8 +350,8 @@ def mem_record(tag="", optimizer=None, model=None, reset_peak=False):
             param_mem += p.numel() * p.element_size()
             if p.grad is not None:
                 grad_mem += p.grad.numel() * p.grad.element_size()
-        print(f"  params    : {param_mem/1024**2:.2f} MB")
-        print(f"  grads     : {grad_mem/1024**2:.2f} MB")
+        print(f"  params    : {param_mem/1024**3:.2f} GB")
+        print(f"  grads     : {grad_mem/1024**3:.2f} GB")
 
     # ===== 2. optimizer states (AdamW exp_avg / exp_avg_sq) =====
     if optimizer is not None:
@@ -362,12 +359,12 @@ def mem_record(tag="", optimizer=None, model=None, reset_peak=False):
             for v in state.values():
                 if torch.is_tensor(v):
                     opt_mem += v.numel() * v.element_size()
-        print(f"  optimizer : {opt_mem/1024**2:.2f} MB")
+        print(f"  optimizer : {opt_mem/1024**3:.2f} GB")
 
     # ===== 3. estimated activations (+ 其它临时张量) =====
     if model is not None or optimizer is not None:
         activations = allocated - param_mem - grad_mem - opt_mem
-        print(f"  act+other : {activations/1024**2:.2f} MB  (allocated - params - grads - optimizer)")
+        print(f"  act+other : {activations/1024**3:.2f} GB  (allocated - params - grads - optimizer)")
 
     if reset_peak:
         torch.cuda.reset_peak_memory_stats()
